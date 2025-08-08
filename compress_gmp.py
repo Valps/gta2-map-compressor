@@ -81,51 +81,6 @@ def convert_int_to_word(integer):  # low endian unsigned
     b2 = integer // 256
     return bytes([b1, b2])
 
-def read_block_side_info(side, str_side):
-    tile_texture_idx = (side % 1024)
-    side = side >> 10
-
-    wall = (side % 2)
-    side = side >> 1
-
-    bullet_wall = (side % 2)
-    side = side >> 1
-
-    flat = (side % 2)
-    side = side >> 1
-
-    flip = (side % 2)
-    side = side >> 1
-
-    tile_rotation = side
-
-    print(f"{str_side} tile: {tile_texture_idx}")
-    #print(f"Tile rotation: {return_rotation_value_str(tile_rotation)}°")
-    #print(f"Wall: {wall}, Bullet Wall: {bullet_wall}")
-    #print(f"Flat: {flat}")
-    #print(f"Flip: {flip}")
-
-def read_lid_info(lid):
-    tile_texture_idx = (lid % 1024)
-    lid = lid >> 10
-
-    lighting_filter = (lid % 4)
-    lid = lid >> 2
-
-    flat = (lid % 2)
-    lid = lid >> 1
-
-    flip = (lid % 2)
-    lid = lid >> 1
-
-    tile_rotation = lid
-
-    print(f"Lid tile: {tile_texture_idx}")
-    #print(f"Tile rotation: {tile_rotation}°")
-    #print(f"Filter: {lighting_filter}")
-    #print(f"Flat: {flat}")
-    #print(f"Flip: {flip}")
-
 def is_slope(block_data):
     slope_byte = block_data[-1]
     slope_byte = slope_byte >> 2
@@ -134,28 +89,6 @@ def is_slope(block_data):
     if (slope_byte > 60):
         return False
     return True
-
-def print_all_info_block_data(block_data):
-    left_side = int.from_bytes(block_data[0:2], 'little')
-    right_side = int.from_bytes(block_data[2:4], 'little')
-    top_side = int.from_bytes(block_data[4:6], 'little')
-    bottom_side = int.from_bytes(block_data[6:8], 'little')
-    lid = int.from_bytes(block_data[8:10], 'little')
-
-    #print("Left side info:")
-    read_block_side_info(left_side, "Left")
-
-    #print("\nRight side info:")
-    read_block_side_info(right_side, "Right")
-
-    #print("\nTop side info:")
-    read_block_side_info(top_side, "Top")
-
-    #print("\nBottom side info:")
-    read_block_side_info(bottom_side, "Bottom")
-
-    #print("\nLid info:")
-    read_lid_info(lid)
 
 # convert PSX slope to PC slope
 def fix_psx_slope(block_data):
@@ -261,35 +194,6 @@ def detect_headers_and_get_chunks(gmp_path):
     print("")
     return chunk_info, data_array
 
-def write_uncompressed_map(output_path, chunk_infos, block_info_array):
-    with open(output_path, 'r+b') as file:
-        
-        umap_offset = chunk_infos["UMAP"][0]
-        size = chunk_infos["UMAP"][1]
-
-        file.seek(umap_offset)
-        
-        current_offset = umap_offset
-
-        x = 0
-        y = 0
-        z = 0
-
-        while (current_offset < umap_offset + size):
-            file.write(block_info_array[z][y][x])
-
-            x += 1
-
-            if (x > 255):
-                x = 0
-                y += 1
-                
-            if (y > 255):
-                y = 0
-                z += 1
-                
-            if (z >= 8):
-                break
 
 ############ DMAP stuff
 
@@ -1045,18 +949,15 @@ def create_gmp_psx_version(output_path, cmap_info, chunk_infos, data):
         file.write(convert_int_to_word(cmap_info["num_partial_blocks"]))
         file.write(cmap_info["partial_block_info"])
 
-        # now pad the last dword of CMAP chunk
+        # now pad the last dword of CMAP chunk.
         offset = file.tell()
-
-        #while offset % DWORD_SIZE != 0:
-        #    file.write(CHUNK_PADDING_BYTE)
-        #    offset += 1
 
         if offset % DWORD_SIZE != 0:
             while offset % DWORD_SIZE != 0:
                 file.write(CHUNK_PADDING_BYTE)
                 offset += 1
         else:
+            # Even if a padding is not necessary, the game requires at least one byte padding or else it will crash
             for _ in range(4):
                 file.write(CHUNK_PADDING_BYTE)
 
@@ -1223,10 +1124,6 @@ def compress_gmp_pc_version(block_info_array, output_path, chunk_infos, data):
     print(f"Num of columns: {len(columns_array)}")
     print(f"Num of unique blocks: {len(block_list)}")
 
-    # if column data size more than 65535, raise exception
-    if num_dwords > WORD_MAX_VALUE:
-        raise WordConvertionException
-
     dmap_info = create_dmap(dmap_base, columns_array, block_list, dword_columns_offset_array)
 
     # now materialize the map file
@@ -1246,12 +1143,67 @@ def compress_gmp_psx_version(block_info_array, output_path, chunk_infos, data):
     print(f"Num of unique complete blocks: {len(complete_block_list)}")
     print(f"Num of unique partial blocks: {len(partial_block_list)}")
 
+    # if column data size more than 65535, raise exception
+    if num_words > WORD_MAX_VALUE:
+        raise WordConvertionException
+
     print("\nFormatting CMAP chunk data...")
     cmap_info = create_cmap(cmap_base, columns_array, complete_block_list, partial_block_list, word_columns_offset_array)
 
     # now materialize the map file
     print("Creating gmp file...")
     create_gmp_psx_version(output_path, cmap_info, chunk_infos, data)
+
+
+def is_opaque(block_data):
+    lid_word = int.from_bytes(block_data[8:10], 'little')
+    tile_idx = lid_word & 1023
+    if tile_idx == 0:
+        return True
+    flat = (lid_word >> 12) & 1
+    if flat:
+        return True
+    return False
+
+def is_air_block(block_data):
+    block_type_byte = block_data[-1]
+    type = block_type_byte % 4
+    if (type == AIR_TYPE):
+        return True
+    return False
+
+def is_empty_block(block_data):
+    if (is_air_block(block_data)):
+        lid_word = int.from_bytes(block_data[8:10], 'little')
+        lid_tile = lid_word % 1024
+        if (lid_tile == 0):
+            left_word = int.from_bytes(block_data[0:2], 'little')
+            right_word = int.from_bytes(block_data[2:4], 'little')
+            top_word = int.from_bytes(block_data[4:6], 'little')
+            bottom_word = int.from_bytes(block_data[6:8], 'little')
+            if (left_word == 0 and right_word == 0 and top_word == 0 and bottom_word == 0):
+                return True
+    return False
+
+# TODO: remove hidden surfaces
+def remove_hidden_surfaces(block_info_array):
+    
+    for y in range(1, MAP_HEIGHT):
+        for x in range(1, MAP_WIDTH):
+            # identify the highest block
+            highest_z = 8
+            for z in reversed(range(MAP_MAX_Z)):
+                block_data = block_info_array[z][y][x]
+                if not is_opaque(block_data):
+                    highest_z = z
+                    break
+
+            for z in reversed(range(highest_z)):
+                block_data = block_info_array[z][y][x]
+                if not is_empty_block(block_data):
+                    pass
+
+    return block_info_array
 
 
 def main():
@@ -1293,6 +1245,9 @@ def main():
     print("Getting block info from uncompressed data...")
     block_info_array = get_block_info_data_from_UMAP(gmp_path, chunk_infos)
 
+    # TODO: remove hidden surfaces
+    if False:
+        block_info_array = remove_hidden_surfaces(block_info_array)
 
     # get output folder path
     parent = gmp_path.parent
@@ -1311,46 +1266,8 @@ def main():
         except WordConvertionException:
             print("Error: Your map has more columns or unique blocks than a CMAP chunk can store (65535). Process aborted.")
 
-    
     return
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    #block_set = get_block_data_set_from_UMAP(gmp_path, chunk_infos)
-    #column_set
-
-    # creating a copy of the target gmp
-
-    filename = get_filename(gmp_path)
-    output_path = ROOT_DIR / f"{filename}_compressed.gmp"
-
-    print(f"Creating copy of {filename}.gmp")
-    shutil.copyfile(gmp_path, output_path)
-
-    # now inject the block info into output
-    print("Injecting block info...")
-    write_uncompressed_map(output_path, chunk_infos, block_info_array)
-
-    #print("Copying other gmp chunks...")
-    #chunk_dict = get_other_chunks(gmp_path, chunk_infos)
-
-    print("Success!")
-        
 
 
 if __name__ == "__main__":
