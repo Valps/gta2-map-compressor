@@ -57,8 +57,8 @@ def get_filename(path):
 def convert_int_to_dword(integer):  # low endian
     b1 = integer % 256
     b2 = (integer >> 8) % 256
-    b3 = (b2 >> 8) % 256
-    b4 = (b3 >> 8) % 256
+    b3 = (integer >> 16) % 256
+    b4 = (integer >> 24) % 256
     return bytes([b1, b2, b3, b4])
 
 def convert_int_to_word(integer):  # low endian
@@ -175,6 +175,7 @@ def detect_headers_and_get_chunks(gmp_path):
                    THSR = [None, None],
                    RGEN = [None, None])
     
+    data_array = []
 
     with open(gmp_path, 'rb') as file:
         
@@ -221,11 +222,12 @@ def detect_headers_and_get_chunks(gmp_path):
 
                 print(f"Header {chunk_header} found! Offset: {hex(header_data_offset)}, Size: {hex(header_size)}")
 
-                file.read(header_size)  # skip data
+                data = file.read(header_size)  # read data # skip data
+                data_array.append((chunk_header, data))
                 
                 current_offset += header_size
     print("")
-    return chunk_info
+    return chunk_info, data_array
 
 def write_uncompressed_map(output_path, chunk_infos, block_info_array):
     with open(output_path, 'r+b') as file:
@@ -717,11 +719,58 @@ def create_columns(block_info_array, block_list):
                 old_time = curr_time
                 print("{:.0%}".format(percentage))
                 
-    print(f"Created columns in {curr_time - init_time} seconds")
+    print(f"Created columns in {(curr_time - init_time):.3f} seconds")
 
     return (dmap_data_indices, columns_array, dword_columns_offset_array)
 
-def create_gmp(output_path, dmap_info, chunk_info):  # zones_info_array, all_anim_data, edit_data
+
+def search_data(input_data, header_to_found):
+    for header, data in input_data:
+        if header == header_to_found:
+            return data
+    raise "Header not found"
+
+def create_dmap(dmap_base_indices, columns_array, block_list, dword_columns_offset_array) -> dict:
+
+    dmap_dict = dict(size=0, base=None, column_dwords=0, column_data=None, num_blocks=0, block_info=None)
+
+    # create base data chunk
+    base = bytes()
+    for y in range(MAP_HEIGHT+1):
+        for x in range(MAP_WIDTH+1):
+            base += convert_int_to_dword(dmap_base_indices[y][x])
+
+    assert len(base) == DWORD_SIZE*256*256
+    dmap_dict["base"] = base
+
+    # create column data
+    column_data = bytes()
+    column_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)    #column_dwords = dword_columns_offset_array[-1]
+    dmap_dict["column_dwords"] = column_dwords
+    for column in columns_array:
+        column_data += column
+    
+    assert len(column_data) == DWORD_SIZE*column_dwords# + len(columns_array[-1])
+    dmap_dict["column_data"] = column_data
+    
+    # create block info data
+    block_info = bytes()
+    num_blocks = len(block_list)
+    dmap_dict["num_blocks"] = num_blocks
+    for block_data in block_list:
+        block_info += block_data
+
+    assert len(block_info) == BLOCK_INFO_SIZE*num_blocks
+    dmap_dict["block_info"] = block_info
+
+    dmap_dict["size"] = len(base) + 4 + len(column_data) + 4 + len(block_info)
+    #print("Len base:", hex(len(base)))
+    #print("DMAP size:", hex(dmap_dict["size"]))
+
+    return dmap_dict
+
+
+def create_gmp(output_path, dmap_info, chunk_info, data):  # zones_info_array, all_anim_data, edit_data
     with open(output_path, 'w+b') as file:
         signature = str.encode("GBMP")
         file.write(signature)
@@ -748,11 +797,10 @@ def create_gmp(output_path, dmap_info, chunk_info):  # zones_info_array, all_ani
         dmap_size = convert_int_to_dword(dmap_info["size"])
         file.write(dmap_size)
 
-        file.write(dmap_info["data"])
-        # TODO: last dword unknown
-        file.write(dmap_info["num_dwords"])
-        file.write(dmap_info["columns"])
-        file.write(dmap_info["num_blocks"])
+        file.write(dmap_info["base"])
+        file.write(convert_int_to_dword(dmap_info["column_dwords"]))
+        file.write(dmap_info["column_data"])
+        file.write(convert_int_to_dword(dmap_info["num_blocks"]))
         file.write(dmap_info["block_info"])
         
 
@@ -763,11 +811,16 @@ def create_gmp(output_path, dmap_info, chunk_info):  # zones_info_array, all_ani
 
             zone_size = convert_int_to_dword(chunk_info["ZONE"][1])
             file.write(zone_size)
+            file.write( search_data(data, "ZONE") )
 
-            file.write(chunk_info["ZONE"][2])   # TODO
+        # PSXM
+        if chunk_info["PSXM"][0] is not None:
+            chunk_header = str.encode("PSXM")
+            file.write(chunk_header)
 
-            #for zone in zones_info_array:
-            #    file.write(zone)
+            psxm_size = convert_int_to_dword(chunk_info["PSXM"][1])
+            file.write(psxm_size)
+            file.write( search_data(data, "PSXM") )
 
         # ANIM
         if chunk_info["ANIM"][0] is not None:
@@ -776,29 +829,7 @@ def create_gmp(output_path, dmap_info, chunk_info):  # zones_info_array, all_ani
 
             anim_size = convert_int_to_dword(chunk_info["ANIM"][1])
             file.write(anim_size)
-
-            file.write(chunk_info["ANIM"][2])   # TODO
-            #file.write(all_anim_data)
-
-        # EDIT
-        #if edit_file is not None:
-        #    edit_file_path = ROOT_DIR / edit_file
-        #    if edit_file_path.exists():
-        #        with open(edit_file_path, 'rb') as edit_file:
-        #            edit_data = edit_file.read()
-        #            file.write(edit_data)
-        #    else:
-        #        print(f"Warning: {edit_file_path} don't exist!")
-
-        if chunk_info["EDIT"][0] is not None:
-            chunk_header = str.encode("EDIT")
-            file.write(chunk_header)
-
-            edit_size = convert_int_to_dword(chunk_info["EDIT"][1])
-            file.write(edit_size)
-
-            file.write(chunk_info["EDIT"][2])   # TODO
-            #file.write(all_edit_data)
+            file.write( search_data(data, "ANIM") )
 
         # LGHT
         if chunk_info["LGHT"][0] is not None:
@@ -807,18 +838,27 @@ def create_gmp(output_path, dmap_info, chunk_info):  # zones_info_array, all_ani
 
             lght_size = convert_int_to_dword(chunk_info["LGHT"][1])
             file.write(lght_size)
-
-            file.write(chunk_info["LGHT"][2])   # TODO
-            #file.write(all_lght_data)
-
+            file.write( search_data(data, "LGHT") )
         
-        
+        # EDIT
+        if chunk_info["EDIT"][0] is not None:
+            chunk_header = str.encode("EDIT")
+            file.write(chunk_header)
+
+            edit_size = convert_int_to_dword(chunk_info["EDIT"][1])
+            file.write(edit_size)
+            file.write( search_data(data, "EDIT") )
+
+        # RGEN
+        if chunk_info["RGEN"][0] is not None:
+            chunk_header = str.encode("RGEN")
+            file.write(chunk_header)
+
+            rgen_size = convert_int_to_dword(chunk_info["RGEN"][1])
+            file.write(rgen_size)
+            file.write( search_data(data, "RGEN") )
     return
 
-
-def create_dmap(dmap_data_indices, columns_array, block_list, dword_columns_offset_array) -> dict:
-    # TODO
-    return
 
 def main():
     parser = argparse.ArgumentParser(PROGRAM_NAME)
@@ -848,7 +888,7 @@ def main():
     #    is_psx = False
     
     print(f"\nOpening file {gmp_path}...\n")
-    chunk_infos = detect_headers_and_get_chunks(gmp_path)
+    chunk_infos, data = detect_headers_and_get_chunks(gmp_path)
 
     if chunk_infos["UMAP"][0] is None:
         print("ERROR: There is nothing to compress. UMAP header is missing.")
@@ -866,13 +906,19 @@ def main():
     print("Creating columns...")
     dmap_data_indices, columns_array, dword_columns_offset_array = create_columns(block_info_array, block_list)
 
-    num_dwords = dword_columns_offset_array[-1] #+ (len(columns_array[-1]))//4
+    #num_dwords = dword_columns_offset_array[-1] #+ (len(columns_array[-1]))//4
+    num_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)
 
     print(f"Num of dwords: {num_dwords}")
     print(f"Num of columns: {len(columns_array)}")
 
-    # TODO
-    #dmap_info_dict = create_dmap(dmap_data_indices, columns_array, block_list, dword_columns_offset_array)
+    dmap_info = create_dmap(dmap_data_indices, columns_array, block_list, dword_columns_offset_array)
+
+    # now materialize the map file
+    parent = gmp_path.parent
+    map_name = get_filename(gmp_path)
+    output_path = parent / (map_name + "_compressed.gmp")
+    create_gmp(output_path, dmap_info, chunk_infos, data)
 
     print("Success!")
     return
