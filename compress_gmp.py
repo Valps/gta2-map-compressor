@@ -20,6 +20,8 @@ BLOCK_INFO_SIZE = 12
 LIGHT_INFO_SIZE = 16
 ZONE_TYPE_COORDS_DATA_SIZE = 5     # not includes the name length neither the name itself
 
+PARTIAL_BLOCK_INFO_SIZE = 4     # lid word + arrow byte + slope byte
+
 LIGHT_MAX_X = 32767     # 255*128 + 64 - 1, where 64 = max offset
 LIGHT_MAX_Y = 32767     # 255*128 + 64 - 1
 
@@ -36,8 +38,16 @@ EMPTY_BLOCK_DATA = bytes( [ 0 for _ in range(BLOCK_INFO_SIZE) ] )
 WORD_SIZE = 2
 DWORD_SIZE = 4
 
-DATA_SIZE = DWORD_SIZE      # use it for DMAP or CMAP
+PARTIAL_BLOCKD_SHIFT = 32768
 
+FIRST_CMAP_PADDING_SIZE = int("0x400", 16)
+SECOND_CMAP_PADDING_SIZE = int("0x600", 16)
+
+CHUNK_PADDING_BYTE = bytes([int("0xAA", 16)])   # only for cmap/psx gmp maps
+
+WORD_MAX_VALUE = 65535  # 0xFFFF
+
+# TODO: convert this code to use classes/objects
 class DMAP_compressed:
     def __init__(self, data: bytes, num_dwords: int, columns_data: bytes, num_blocks: int, block_info: bytes):
         self.data = data
@@ -46,26 +56,30 @@ class DMAP_compressed:
         self.num_blocks = num_blocks
         self.block_info = block_info
 
+class WordConvertionException(Exception):
+    pass
+
 def get_filename(path):
     str_path = str(path)
     i = str_path.rfind('\\') + 1
     j = str_path.rfind('.')
     return str_path[i:j]
 
-def convert_int_to_dword(integer):  # low endian
+def convert_int_to_dword(integer):  # low endian unsigned
     b1 = integer % 256
     b2 = (integer >> 8) % 256
     b3 = (integer >> 16) % 256
     b4 = (integer >> 24) % 256
     return bytes([b1, b2, b3, b4])
 
-def convert_int_to_word(integer):  # low endian
+def convert_int_to_word(integer):  # low endian unsigned
+    # ensure that it's a u16 type
+    if integer > WORD_MAX_VALUE:
+        raise WordConvertionException
+    
     b1 = integer % 256
     b2 = integer // 256
     return bytes([b1, b2])
-
-#def concatenate_bytes(byte1, byte2):
-#    return byte1 + byte2
 
 def read_block_side_info(side, str_side):
     tile_texture_idx = (side % 1024)
@@ -143,6 +157,7 @@ def print_all_info_block_data(block_data):
     #print("\nLid info:")
     read_lid_info(lid)
 
+# convert PSX slope to PC slope
 def fix_psx_slope(block_data):
     slope_byte = block_data[-1]
     slope_byte = slope_byte >> 2
@@ -152,6 +167,25 @@ def fix_psx_slope(block_data):
         if tile_texture_idx == 384:
             tile_texture_idx = 1023
             lid = lid | tile_texture_idx    # set all lowest 10 bits to 1  (1111 1111 11 = 1023)
+            new_block_data = block_data[:8] + bytes([lid % 256, lid // 256]) + block_data[10:]
+        else:
+            new_block_data = block_data
+    else:
+        new_block_data = block_data
+    return new_block_data
+
+# convert PC slope to PSX slope
+def fix_pc_slope(block_data):
+    slope_byte = block_data[-1]
+    slope_byte = slope_byte >> 2
+    if (49 <= slope_byte <= 52):
+        lid = int.from_bytes(block_data[8:10], 'little')
+        tile_texture_idx = (lid % 1024)
+        if tile_texture_idx == 1023:
+            tile_texture_idx = 384
+
+            lid = lid & ~1023                # clear all lowest 10 bits
+            lid = lid | tile_texture_idx     # set tile_texture_idx
             new_block_data = block_data[:8] + bytes([lid % 256, lid // 256]) + block_data[10:]
         else:
             new_block_data = block_data
@@ -527,8 +561,6 @@ def CMAP_decompress(gmp_path, chunk_infos, block_data_finish_offset, block_data_
     return block_info_array
 
 
-
-
 def uncompress_gmp(gmp_path, chunk_infos, psx):
 
     if not psx and chunk_infos["DMAP"][0] is None:
@@ -613,15 +645,161 @@ def get_block_data_set_from_UMAP(gmp_path, chunk_infos):
 
     return block_set
 
-def create_set_from_array(block_info_array):
-    block_set = { block_info_array[0][0][0] }
-    for z in range(len(block_info_array)):
-        for y in range(len(block_info_array[z])):
-            for x in range(len(block_info_array[z][y])):
-                block_set.add(block_info_array[z][y][x])
-    return block_set
 
-def create_columns(block_info_array):
+def is_partial_block(block_data) -> bool:
+    """A partial block has only lid, i.e. all of its sides doesn't exists."""
+
+    left = int.from_bytes(block_data[0:2],'little')
+    right = int.from_bytes(block_data[2:4],'little')
+    top = int.from_bytes(block_data[4:6],'little')
+    bottom = int.from_bytes(block_data[6:8],'little')
+    #lid = int.from_bytes(block_data[8:10],'little')
+    if left == 0 and right == 0 and top == 0 and bottom == 0:
+        return True
+    return False
+
+def get_partial_data_from_block(block_data):
+    return block_data[8:]
+
+def create_cmap_columns(block_info_array):
+    columns_array = []
+    columns_set = set()
+
+    word_column_offset = 0
+    word_columns_offset_array = []
+
+    percentage = 0
+
+    init_time = time.time()
+    old_time = init_time
+
+    cmap_base = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
+
+    complete_block_list = []
+    complete_block_set = set()      # speed up process: instead of searching on a list, search on the set
+
+    partial_block_list = [EMPTY_BLOCK_DATA]     # the empty block is always the first
+    partial_block_set = {EMPTY_BLOCK_DATA}      # speed up process
+
+    for y in range(MAP_HEIGHT+1):
+        for x in range(MAP_WIDTH+1):
+            
+            offset = 0
+            height = 0
+            empty_blocks_finished = False
+
+            blockd_array = []
+
+            for z in range(MAP_MAX_Z+1):
+                block_data = block_info_array[z][y][x]
+
+                if is_slope(block_data):
+                    block_data = fix_pc_slope(block_data)   # convert PC slope to PSX slope
+
+                block_in_list = False       # boolean flag to prevent searching twice on the list
+                bis_partial_block = False
+
+                # now handle block array
+                if is_partial_block(block_data):
+                    # is partial block
+                    bis_partial_block = True
+                    if block_data not in partial_block_set:     # possible hash collision is treated further ahead
+                        partial_block_list.append(block_data)
+                        partial_block_set.add(block_data)
+                    else:
+                        block_in_list = True
+
+                else:
+                    # isn't partial block
+                    if block_data not in complete_block_set:     # possible hash collision is treated further ahead
+                        complete_block_list.append(block_data)
+                        complete_block_set.add(block_data)
+                    else:
+                        block_in_list = True
+
+                # column logic: the first empty blocks (from bottom to top) must be accounted in 'offset'.
+                # If there are empty blocks above the first non-empty block, register blockid = 0.
+
+                if block_data == EMPTY_BLOCK_DATA:
+                    if not empty_blocks_finished:
+                        offset += 1
+                    else:
+                        blockd_array.append( PARTIAL_BLOCKD_SHIFT + 0 )    # empty blocks has blockd always zero of partial blocks
+                else:
+                    empty_blocks_finished = True
+                    height = z + 1
+
+                    # now register block in blockd array
+
+                    if block_in_list:
+
+                        if bis_partial_block:
+                            # is partial block
+                            # handle eventual hash collisions
+                            try:
+                                blockd_array.append( PARTIAL_BLOCKD_SHIFT + partial_block_list.index(block_data) )
+                            except ValueError:
+                                print("WARNING: Hash Collision detected! Handling it...")
+                                partial_block_list.append(block_data)
+                                blockd_array.append( PARTIAL_BLOCKD_SHIFT + len(partial_block_list) - 1 )
+                        
+                        else:
+                            # isnt partial block
+                            # handle eventual hash collisions
+                            try:
+                                blockd_array.append( complete_block_list.index(block_data) )
+                            except ValueError:
+                                print("WARNING: Hash Collision detected! Handling it...")
+                                complete_block_list.append(block_data)
+                                blockd_array.append( len(complete_block_list) - 1 )
+                    else:
+                        # register the most recent added block in the array
+                        if bis_partial_block:
+                            blockd_array.append( PARTIAL_BLOCKD_SHIFT + len(partial_block_list) - 1 )  # last index of the list
+                        else:
+                            blockd_array.append( len(complete_block_list) - 1 )  # last index of the list
+
+            if offset == MAP_MAX_Z:
+                height = 0
+                offset = 0
+
+            # encode column height & offset
+            column_data = bytes([height, offset])
+
+            num_blocks = height - offset
+
+            # encode blockd
+            for block_col_idx in range(num_blocks):     # ignore the highests empty blocks
+                column_data += convert_int_to_word( blockd_array[block_col_idx] )
+
+            try:
+                # If not raise exception, there is already the column on the array
+                cmap_base[y][x] = word_columns_offset_array[ columns_array.index(column_data) ]
+            except ValueError:
+                # new column, so register it
+                columns_set.add(column_data)
+                columns_array.append(column_data)
+
+                word_columns_offset_array.append(word_column_offset)
+                
+                # encode column dword to populate "data[256][256]"
+                cmap_base[y][x] = word_column_offset
+
+                word_column_offset += len(column_data) // WORD_SIZE    # 2 = size of word
+
+            percentage += 0.00001525878
+
+            curr_time = time.time()
+            if (curr_time - old_time > 5):
+                old_time = curr_time
+                print("{:.0%}".format(percentage), end=" \r")
+
+    print("100%")
+    print(f"Created columns in {(curr_time - init_time):.3f} seconds")
+
+    return (cmap_base, columns_array, word_columns_offset_array, complete_block_list, partial_block_list)
+
+def create_dmap_columns(block_info_array):
     columns_array = []
     columns_set = set()
 
@@ -633,7 +811,7 @@ def create_columns(block_info_array):
     init_time = time.time()
     old_time = init_time
 
-    dmap_data_indices = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
+    dmap_base = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
 
     block_list = [EMPTY_BLOCK_DATA]     # the empty block is always the first
     block_set = {EMPTY_BLOCK_DATA}      # speed up process: instead of searching on a list, search on the set
@@ -650,26 +828,31 @@ def create_columns(block_info_array):
             for z in range(MAP_MAX_Z+1):
                 block_data = block_info_array[z][y][x]
 
-                block_in_list = False       # boolean flag to prevent duplicate searching on the list
+                block_in_list = False       # boolean flag to prevent searching twice on the list
 
                 # now handle block array
-                if block_data not in block_set:     # python sets use hash, so it can trigger false negatives, but duplicates isn't really a problem here
+                if block_data not in block_set:     # possible hash collision is treated further ahead
                     block_list.append(block_data)
                     block_set.add(block_data)
                 else:
                     block_in_list = True
 
+                # column logic: the first empty blocks (from bottom to top) must be accounted in 'offset'.
+                # If there are empty blocks above the first non-empty block, register blockid = 0.
+
                 if block_data == EMPTY_BLOCK_DATA:
                     if not empty_blocks_finished:
                         offset += 1
                     else:
-                        blockd_array.append( 0 ) # block_list.index(block_data)     empty blocks has blockd always zero
+                        blockd_array.append( 0 )    # empty blocks has blockd always zero
                 else:
                     empty_blocks_finished = True
                     height = z + 1
 
+                    # now register block in blockd array
+
                     if block_in_list:
-                        # handle hash collisions
+                        # handle eventual hash collisions
                         try:
                             blockd_array.append( block_list.index(block_data) )
                         except ValueError:
@@ -677,6 +860,7 @@ def create_columns(block_info_array):
                             block_list.append(block_data)
                             blockd_array.append( len(block_list) - 1 )
                     else:
+                        # register the most recent added block in the array
                         blockd_array.append( len(block_list) - 1 )  # last index of the list
 
             if offset == MAP_MAX_Z:
@@ -694,7 +878,7 @@ def create_columns(block_info_array):
 
             try:
                 # If not raise exception, there is already the column on the array
-                dmap_data_indices[y][x] = dword_columns_offset_array[ columns_array.index(column_data) ]
+                dmap_base[y][x] = dword_columns_offset_array[ columns_array.index(column_data) ]
             except ValueError:
                 # new column, so register it
                 columns_set.add(column_data)
@@ -703,40 +887,21 @@ def create_columns(block_info_array):
                 dword_columns_offset_array.append(dword_column_offset)
                 
                 # encode column dword to populate "data[256][256]"
-                dmap_data_indices[y][x] = dword_column_offset
+                dmap_base[y][x] = dword_column_offset
 
-                dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
-
-
-
-            if False:   # old
-                if column_data not in columns_set:
-                    # new column, so register it
-                    columns_set.add(column_data)
-                    columns_array.append(column_data)
-
-                    dword_columns_offset_array.append(dword_column_offset)
-                    dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
-
-                    # encode column dword to populate "data[256][256]"
-                    dmap_data_indices[y][x] = dmap_index
-                    dmap_index += 1
-                else:
-                    # there is already the column on the array
-                    dmap_data_indices[y][x] = columns_array.index(column_data)
+                dword_column_offset += len(column_data) // DWORD_SIZE    # 4 = size of dword
 
             percentage += 0.00001525878
-
-            
 
             curr_time = time.time()
             if (curr_time - old_time > 5):
                 old_time = curr_time
-                print("{:.0%}".format(percentage))
-                
+                print("{:.0%}".format(percentage), end=" \r")
+
+    print("100%")
     print(f"Created columns in {(curr_time - init_time):.3f} seconds")
 
-    return (dmap_data_indices, columns_array, dword_columns_offset_array, block_list)
+    return (dmap_base, columns_array, dword_columns_offset_array, block_list)
 
 
 def search_data(input_data, header_to_found):
@@ -745,7 +910,67 @@ def search_data(input_data, header_to_found):
             return data
     raise "Header not found"
 
-def create_dmap(dmap_base_indices, columns_array, block_list, dword_columns_offset_array) -> dict:
+def create_cmap(cmap_base, columns_array, complete_block_list, partial_block_list, word_columns_offset_array):
+    cmap_dict = dict(size=0, 
+                     base=None, 
+                     column_words=0, 
+                     column_data=None, 
+                     num_complete_blocks=0, 
+                     complete_block_info=None,
+                     num_partial_blocks=0, 
+                     partial_block_info=None)
+
+    # create base data chunk
+    #print("Creating CMAP base data...")
+    base = bytes()
+    for y in range(MAP_HEIGHT+1):
+        for x in range(MAP_WIDTH+1):
+            base += convert_int_to_word(cmap_base[y][x])
+
+    assert len(base) == WORD_SIZE*256*256
+    cmap_dict["base"] = base
+
+    # create column data
+    #print("Creating column data...")
+    column_data = bytes()
+    column_words = word_columns_offset_array[-1] + ((len(columns_array[-1])) // WORD_SIZE)
+    cmap_dict["column_words"] = column_words
+    for column in columns_array:
+        column_data += column
+
+    assert len(column_data) == WORD_SIZE*column_words # + len(columns_array[-1])
+    cmap_dict["column_data"] = column_data
+
+    # create complete block info data
+    #print("Creating complete block data...")
+    complete_block_info = bytes()
+    num_complete_blocks = len(complete_block_list)
+    cmap_dict["num_complete_blocks"] = num_complete_blocks
+    for block_data in complete_block_list:
+        complete_block_info += block_data
+
+    assert len(complete_block_info) == BLOCK_INFO_SIZE*num_complete_blocks
+    cmap_dict["complete_block_info"] = complete_block_info
+
+
+    # create partial block info data
+    #print("Creating partial block data...")
+    partial_block_info = bytes()
+    num_partial_blocks = len(partial_block_list)
+    cmap_dict["num_partial_blocks"] = num_partial_blocks
+    for block_data in partial_block_list:
+        partial_block_info += get_partial_data_from_block(block_data)
+
+    assert len(partial_block_info) == PARTIAL_BLOCK_INFO_SIZE*num_partial_blocks
+    cmap_dict["partial_block_info"] = partial_block_info
+
+    cmap_dict["size"] = ( len(base) + WORD_SIZE + len(column_data) + FIRST_CMAP_PADDING_SIZE + WORD_SIZE 
+                          + len(complete_block_info) + SECOND_CMAP_PADDING_SIZE + WORD_SIZE + len(partial_block_info) )
+
+    return cmap_dict
+
+
+def create_dmap(dmap_base, columns_array, block_list, dword_columns_offset_array) -> dict:
 
     dmap_dict = dict(size=0, base=None, column_dwords=0, column_data=None, num_blocks=0, block_info=None)
 
@@ -753,19 +978,19 @@ def create_dmap(dmap_base_indices, columns_array, block_list, dword_columns_offs
     base = bytes()
     for y in range(MAP_HEIGHT+1):
         for x in range(MAP_WIDTH+1):
-            base += convert_int_to_dword(dmap_base_indices[y][x])
+            base += convert_int_to_dword(dmap_base[y][x])
 
     assert len(base) == DWORD_SIZE*256*256
     dmap_dict["base"] = base
 
     # create column data
     column_data = bytes()
-    column_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)
+    column_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // DWORD_SIZE)
     dmap_dict["column_dwords"] = column_dwords
     for column in columns_array:
         column_data += column
     
-    assert len(column_data) == DWORD_SIZE*column_dwords # + len(columns_array[-1])
+    assert len(column_data) == DWORD_SIZE*column_dwords
     dmap_dict["column_data"] = column_data
     
     # create block info data
@@ -778,14 +1003,127 @@ def create_dmap(dmap_base_indices, columns_array, block_list, dword_columns_offs
     assert len(block_info) == BLOCK_INFO_SIZE*num_blocks
     dmap_dict["block_info"] = block_info
 
-    dmap_dict["size"] = len(base) + 4 + len(column_data) + 4 + len(block_info)
-    #print("Len base:", hex(len(base)))
-    #print("DMAP size:", hex(dmap_dict["size"]))
+    dmap_dict["size"] = len(base) + DWORD_SIZE + len(column_data) + DWORD_SIZE + len(block_info)
 
     return dmap_dict
 
 
-def create_gmp(output_path, dmap_info, chunk_info, data):  # zones_info_array, all_anim_data, edit_data
+def create_gmp_psx_version(output_path, cmap_info, chunk_infos, data):
+    with open(output_path, 'w+b') as file:
+        # CMAP
+        chunk_header = str.encode("CMAP")
+        file.write(chunk_header)
+
+        cmap_size = convert_int_to_dword(cmap_info["size"])
+        file.write(cmap_size)
+
+        file.write(cmap_info["base"])
+        file.write(convert_int_to_word(cmap_info["column_words"]))
+        file.write(cmap_info["column_data"])
+
+        # first padding
+        pad_1 = bytes()
+        for _ in range(FIRST_CMAP_PADDING_SIZE):
+            pad_1 += bytes([0])
+
+        assert len(pad_1) == FIRST_CMAP_PADDING_SIZE
+        file.write(pad_1)
+
+        # now write complete block info
+        file.write(convert_int_to_word(cmap_info["num_complete_blocks"]))
+        file.write(cmap_info["complete_block_info"])
+
+        # second padding
+        pad_2 = bytes()
+        for _ in range(SECOND_CMAP_PADDING_SIZE):
+            pad_2 += bytes([0])
+
+        assert len(pad_2) == SECOND_CMAP_PADDING_SIZE
+        file.write(pad_2)
+
+        # now write partial block info
+        file.write(convert_int_to_word(cmap_info["num_partial_blocks"]))
+        file.write(cmap_info["partial_block_info"])
+
+        # now pad the last dword of CMAP chunk
+        offset = file.tell()
+
+        #while offset % DWORD_SIZE != 0:
+        #    file.write(CHUNK_PADDING_BYTE)
+        #    offset += 1
+
+        if offset % DWORD_SIZE != 0:
+            while offset % DWORD_SIZE != 0:
+                file.write(CHUNK_PADDING_BYTE)
+                offset += 1
+        else:
+            for _ in range(4):
+                file.write(CHUNK_PADDING_BYTE)
+
+        # CMAP chunk finished!
+
+        # ZONE
+        if chunk_infos["ZONE"][0] is not None:
+            chunk_header = str.encode("ZONE")
+            file.write(chunk_header)
+
+            zone_size = convert_int_to_dword(chunk_infos["ZONE"][1])
+            file.write(zone_size)
+            file.write( search_data(data, "ZONE") )
+
+            # now pad the last dword
+            offset = file.tell()
+            if offset % DWORD_SIZE != 0:
+                while offset % DWORD_SIZE != 0:
+                    file.write(CHUNK_PADDING_BYTE)
+                    offset += 1
+            else:
+                for _ in range(4):
+                    file.write(CHUNK_PADDING_BYTE)
+
+        # ANIM
+        if chunk_infos["ANIM"][0] is not None:
+            chunk_header = str.encode("ANIM")
+            file.write(chunk_header)
+
+            anim_size = convert_int_to_dword(chunk_infos["ANIM"][1])
+            file.write(anim_size)
+            file.write( search_data(data, "ANIM") )
+
+            # now pad the last dword
+            offset = file.tell()
+            if offset % DWORD_SIZE != 0:
+                while offset % DWORD_SIZE != 0:
+                    file.write(CHUNK_PADDING_BYTE)
+                    offset += 1
+            else:
+                for _ in range(4):
+                    file.write(CHUNK_PADDING_BYTE)
+
+        # RGEN
+        if chunk_infos["RGEN"][0] is not None:
+            chunk_header = str.encode("RGEN")
+            file.write(chunk_header)
+
+            rgen_size = convert_int_to_dword(chunk_infos["RGEN"][1])
+            file.write(rgen_size)
+            file.write( search_data(data, "RGEN") )
+
+            # now pad the last dword
+            offset = file.tell()
+            if offset % DWORD_SIZE != 0:
+                while offset % DWORD_SIZE != 0:
+                    file.write(CHUNK_PADDING_BYTE)
+                    offset += 1
+            else:
+                for _ in range(4):
+                    file.write(CHUNK_PADDING_BYTE)
+    
+    return 0
+
+
+
+def create_gmp_pc_version(output_path, dmap_info, chunk_info, data):
     with open(output_path, 'w+b') as file:
         signature = str.encode("GBMP")
         file.write(signature)
@@ -872,7 +1210,48 @@ def create_gmp(output_path, dmap_info, chunk_info, data):  # zones_info_array, a
             rgen_size = convert_int_to_dword(chunk_info["RGEN"][1])
             file.write(rgen_size)
             file.write( search_data(data, "RGEN") )
-    return
+    return 0
+
+# Compress map to PC version
+def compress_gmp_pc_version(block_info_array, output_path, chunk_infos, data):
+    print("Creating DMAP columns...")
+    dmap_base, columns_array, dword_columns_offset_array, block_list = create_dmap_columns(block_info_array)
+
+    num_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // DWORD_SIZE)
+
+    print(f"Num of dwords: {num_dwords}")
+    print(f"Num of columns: {len(columns_array)}")
+    print(f"Num of unique blocks: {len(block_list)}")
+
+    # if column data size more than 65535, raise exception
+    if num_dwords > WORD_MAX_VALUE:
+        raise WordConvertionException
+
+    dmap_info = create_dmap(dmap_base, columns_array, block_list, dword_columns_offset_array)
+
+    # now materialize the map file
+    print("Creating gmp file...")
+    create_gmp_pc_version(output_path, dmap_info, chunk_infos, data)
+
+
+# Compress map to PSX version
+def compress_gmp_psx_version(block_info_array, output_path, chunk_infos, data):
+    print("Creating CMAP columns...")
+    cmap_base, columns_array, word_columns_offset_array, complete_block_list, partial_block_list = create_cmap_columns(block_info_array)
+
+    num_words = word_columns_offset_array[-1] + ((len(columns_array[-1])) // WORD_SIZE)
+
+    print(f"Num of words: {num_words}")
+    print(f"Num of columns: {len(columns_array)}")
+    print(f"Num of unique complete blocks: {len(complete_block_list)}")
+    print(f"Num of unique partial blocks: {len(partial_block_list)}")
+
+    print("\nFormatting CMAP chunk data...")
+    cmap_info = create_cmap(cmap_base, columns_array, complete_block_list, partial_block_list, word_columns_offset_array)
+
+    # now materialize the map file
+    print("Creating gmp file...")
+    create_gmp_psx_version(output_path, cmap_info, chunk_infos, data)
 
 
 def main():
@@ -902,6 +1281,8 @@ def main():
     else:
         is_psx = False
     
+    print(f"Compression mode: {args.platform.upper()} map")
+
     print(f"\nOpening file {gmp_path}...\n")
     chunk_infos, data = detect_headers_and_get_chunks(gmp_path)
 
@@ -912,25 +1293,25 @@ def main():
     print("Getting block info from uncompressed data...")
     block_info_array = get_block_info_data_from_UMAP(gmp_path, chunk_infos)
 
-    print("Creating columns...")
-    dmap_data_indices, columns_array, dword_columns_offset_array, block_list = create_columns(block_info_array)
 
-    #num_dwords = dword_columns_offset_array[-1] #+ (len(columns_array[-1]))//4
-    num_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)
-
-    print(f"Num of dwords: {num_dwords}")
-    print(f"Num of columns: {len(columns_array)}")
-    print(f"Num of unique blocks: {len(block_list)}")
-
-    dmap_info = create_dmap(dmap_data_indices, columns_array, block_list, dword_columns_offset_array)
-
-    # now materialize the map file
+    # get output folder path
     parent = gmp_path.parent
     map_name = get_filename(gmp_path)
-    output_path = parent / (map_name + "_compressed.gmp")
-    create_gmp(output_path, dmap_info, chunk_infos, data)
+    
+    # now compress the map
+    if not is_psx:
+        output_path = parent / (map_name + "_compressed.gmp")
+        compress_gmp_pc_version(block_info_array, output_path, chunk_infos, data)
+        print("\nSuccess! GMP compressed!")
+    else:
+        output_path = parent / (map_name + "_psx_compressed.gmp")
+        try:
+            compress_gmp_psx_version(block_info_array, output_path, chunk_infos, data)
+            print("\nSuccess! GMP converted to PSX map!")
+        except WordConvertionException:
+            print("Error: Your map has more columns or unique blocks than a CMAP chunk can store (65535). Process aborted.")
 
-    print("Success!")
+    
     return
 
 
