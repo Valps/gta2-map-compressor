@@ -33,8 +33,6 @@ CMAP_COLUMN_OFFSET = 256*256*2
 
 EMPTY_BLOCK_DATA = bytes( [ 0 for _ in range(BLOCK_INFO_SIZE) ] )
 
-EMPTY_BLOCK_HASH = hash(EMPTY_BLOCK_DATA)
-
 WORD_SIZE = 2
 DWORD_SIZE = 4
 
@@ -623,105 +621,6 @@ def create_set_from_array(block_info_array):
                 block_set.add(block_info_array[z][y][x])
     return block_set
 
-def create_columns_old(block_info_array, block_list):
-    columns_array = []
-    columns_set = set()
-
-    dword_column_offset = 0
-    dword_columns_offset_array = []
-
-    percentage = 0
-
-    init_time = time.time()
-    old_time = init_time
-
-    dmap_data_indices = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
-
-    for y in range(MAP_HEIGHT+1):
-        for x in range(MAP_WIDTH+1):
-            
-            offset = 0
-            height = 0
-            empty_blocks_finished = False
-
-            blockd_array = []
-
-            for z in range(MAP_MAX_Z+1):
-                block_data = block_info_array[z][y][x]
-                if block_data == EMPTY_BLOCK_DATA:
-                    if not empty_blocks_finished:
-                        offset += 1
-                    else:
-                        blockd_array.append( 0 ) # block_list.index(block_data)     empty blocks has blockd always zero
-                else:
-                    empty_blocks_finished = True
-                    height = z + 1
-
-                    blockd_array.append( block_list.index(block_data) ) # TODO: construct block_list in this function, so this line will run faster
-
-            if offset == MAP_MAX_Z:
-                height = 0
-                offset = 0
-
-            # encode column height, offset & padding
-            column_data = bytes([height, offset, 0, 0])
-
-            num_blocks = height - offset
-
-            # encode blockd
-            for block_col_idx in range(num_blocks):     # ignore the highests empty blocks
-                column_data += convert_int_to_dword( blockd_array[block_col_idx] )
-
-            try:
-                # If not raise exception, there is already the column on the array
-                dmap_data_indices[y][x] = dword_columns_offset_array[ columns_array.index(column_data) ]
-            except ValueError:
-                # new column, so register it
-                columns_set.add(column_data)
-                columns_array.append(column_data)
-
-                dword_columns_offset_array.append(dword_column_offset)
-                
-                # encode column dword to populate "data[256][256]"
-                dmap_data_indices[y][x] = dword_column_offset
-
-                dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
-
-
-
-            if False:   # old
-                if column_data not in columns_set:
-                    # new column, so register it
-                    columns_set.add(column_data)
-                    columns_array.append(column_data)
-
-                    dword_columns_offset_array.append(dword_column_offset)
-                    dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
-
-                    # encode column dword to populate "data[256][256]"
-                    dmap_data_indices[y][x] = dmap_index
-                    dmap_index += 1
-                else:
-                    # there is already the column on the array
-                    dmap_data_indices[y][x] = columns_array.index(column_data)
-
-            percentage += 0.00001525878
-
-            
-
-            curr_time = time.time()
-            if (curr_time - old_time > 5):
-                old_time = curr_time
-                print("{:.0%}".format(percentage))
-                
-    print(f"Created columns in {(curr_time - init_time):.3f} seconds")
-
-    return (dmap_data_indices, columns_array, dword_columns_offset_array)
-
-
-
-#  the true column creator
-
 def create_columns(block_info_array):
     columns_array = []
     columns_set = set()
@@ -737,6 +636,7 @@ def create_columns(block_info_array):
     dmap_data_indices = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
 
     block_list = [EMPTY_BLOCK_DATA]     # the empty block is always the first
+    block_set = {EMPTY_BLOCK_DATA}      # speed up process: instead of searching on a list, search on the set
 
     for y in range(MAP_HEIGHT+1):
         for x in range(MAP_WIDTH+1):
@@ -753,8 +653,9 @@ def create_columns(block_info_array):
                 block_in_list = False       # boolean flag to prevent duplicate searching on the list
 
                 # now handle block array
-                if block_data not in block_list:
+                if block_data not in block_set:     # python sets use hash, so it can trigger false negatives, but duplicates isn't really a problem here
                     block_list.append(block_data)
+                    block_set.add(block_data)
                 else:
                     block_in_list = True
 
@@ -768,7 +669,13 @@ def create_columns(block_info_array):
                     height = z + 1
 
                     if block_in_list:
-                        blockd_array.append( block_list.index(block_data) )
+                        # handle hash collisions
+                        try:
+                            blockd_array.append( block_list.index(block_data) )
+                        except ValueError:
+                            print("WARNING: Hash Collision detected! Handling it...")
+                            block_list.append(block_data)
+                            blockd_array.append( len(block_list) - 1 )
                     else:
                         blockd_array.append( len(block_list) - 1 )  # last index of the list
 
@@ -971,11 +878,11 @@ def create_gmp(output_path, dmap_info, chunk_info, data):  # zones_info_array, a
 def main():
     parser = argparse.ArgumentParser(PROGRAM_NAME)
     parser.add_argument("gmp_path")
-    #parser.add_argument("platform")
+    parser.add_argument("platform")
     args = parser.parse_args()
 
-    if (not args.gmp_path):
-        #or args.platform.lower() not in PLATFORMS):
+    if (not args.gmp_path
+        or args.platform.lower() not in PLATFORMS):
         print("Usage: python [program path] [gmp path] [platform=pc,psx]")
         sys.exit(-1)
 
@@ -990,10 +897,10 @@ def main():
         print(f"Input gmp file doesn't exists. Input Path: {gmp_path}")
         sys.exit(-1)
 
-    #if args.platform.lower() == "psx":
-    #    is_psx = True
-    #else:
-    #    is_psx = False
+    if args.platform.lower() == "psx":
+        is_psx = True
+    else:
+        is_psx = False
     
     print(f"\nOpening file {gmp_path}...\n")
     chunk_infos, data = detect_headers_and_get_chunks(gmp_path)
@@ -1005,18 +912,7 @@ def main():
     print("Getting block info from uncompressed data...")
     block_info_array = get_block_info_data_from_UMAP(gmp_path, chunk_infos)
 
-
-    if False:
-        print("Creating set from block array...")
-        block_set = create_set_from_array(block_info_array)     # exclude repeated blocks
-
-        block_list = list(block_set)
-
-        print(f"Num of unique blocks: {len(block_list)}")
-
-
     print("Creating columns...")
-    #dmap_data_indices, columns_array, dword_columns_offset_array = create_columns_old(block_info_array, block_list)
     dmap_data_indices, columns_array, dword_columns_offset_array, block_list = create_columns(block_info_array)
 
     #num_dwords = dword_columns_offset_array[-1] #+ (len(columns_array[-1]))//4
