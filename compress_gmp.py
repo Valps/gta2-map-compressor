@@ -623,7 +623,7 @@ def create_set_from_array(block_info_array):
                 block_set.add(block_info_array[z][y][x])
     return block_set
 
-def create_columns(block_info_array, block_list):
+def create_columns_old(block_info_array, block_list):
     columns_array = []
     columns_set = set()
 
@@ -636,7 +636,6 @@ def create_columns(block_info_array, block_list):
     old_time = init_time
 
     dmap_data_indices = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
-    dmap_index = 0      # first column
 
     for y in range(MAP_HEIGHT+1):
         for x in range(MAP_WIDTH+1):
@@ -647,18 +646,16 @@ def create_columns(block_info_array, block_list):
 
             blockd_array = []
 
-            #column_block_array = []        # TODO: is this necessary?
-
             for z in range(MAP_MAX_Z+1):
                 block_data = block_info_array[z][y][x]
                 if block_data == EMPTY_BLOCK_DATA:
                     if not empty_blocks_finished:
                         offset += 1
                     else:
-                        blockd_array.append( 0 ) # block_list.index(block_data)     empty blocks always zero
+                        blockd_array.append( 0 ) # block_list.index(block_data)     empty blocks has blockd always zero
                 else:
                     empty_blocks_finished = True
-                    height = z
+                    height = z + 1
 
                     blockd_array.append( block_list.index(block_data) ) # TODO: construct block_list in this function, so this line will run faster
 
@@ -674,23 +671,21 @@ def create_columns(block_info_array, block_list):
             # encode blockd
             for block_col_idx in range(num_blocks):     # ignore the highests empty blocks
                 column_data += convert_int_to_dword( blockd_array[block_col_idx] )
-            
-
 
             try:
                 # If not raise exception, there is already the column on the array
-                dmap_data_indices[y][x] = columns_array.index(column_data)
+                dmap_data_indices[y][x] = dword_columns_offset_array[ columns_array.index(column_data) ]
             except ValueError:
                 # new column, so register it
                 columns_set.add(column_data)
                 columns_array.append(column_data)
 
                 dword_columns_offset_array.append(dword_column_offset)
-                dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
-
+                
                 # encode column dword to populate "data[256][256]"
-                dmap_data_indices[y][x] = dmap_index
-                dmap_index += 1
+                dmap_data_indices[y][x] = dword_column_offset
+
+                dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
 
 
 
@@ -724,6 +719,119 @@ def create_columns(block_info_array, block_list):
     return (dmap_data_indices, columns_array, dword_columns_offset_array)
 
 
+
+#  the true column creator
+
+def create_columns(block_info_array):
+    columns_array = []
+    columns_set = set()
+
+    dword_column_offset = 0
+    dword_columns_offset_array = []
+
+    percentage = 0
+
+    init_time = time.time()
+    old_time = init_time
+
+    dmap_data_indices = [ [ 0 for _ in range(256) ] for _ in range(256) ]   # init
+
+    block_list = [EMPTY_BLOCK_DATA]     # the empty block is always the first
+
+    for y in range(MAP_HEIGHT+1):
+        for x in range(MAP_WIDTH+1):
+            
+            offset = 0
+            height = 0
+            empty_blocks_finished = False
+
+            blockd_array = []
+
+            for z in range(MAP_MAX_Z+1):
+                block_data = block_info_array[z][y][x]
+
+                block_in_list = False       # boolean flag to prevent duplicate searching on the list
+
+                # now handle block array
+                if block_data not in block_list:
+                    block_list.append(block_data)
+                else:
+                    block_in_list = True
+
+                if block_data == EMPTY_BLOCK_DATA:
+                    if not empty_blocks_finished:
+                        offset += 1
+                    else:
+                        blockd_array.append( 0 ) # block_list.index(block_data)     empty blocks has blockd always zero
+                else:
+                    empty_blocks_finished = True
+                    height = z + 1
+
+                    if block_in_list:
+                        blockd_array.append( block_list.index(block_data) )
+                    else:
+                        blockd_array.append( len(block_list) - 1 )  # last index of the list
+
+            if offset == MAP_MAX_Z:
+                height = 0
+                offset = 0
+
+            # encode column height, offset & padding
+            column_data = bytes([height, offset, 0, 0])
+
+            num_blocks = height - offset
+
+            # encode blockd
+            for block_col_idx in range(num_blocks):     # ignore the highests empty blocks
+                column_data += convert_int_to_dword( blockd_array[block_col_idx] )
+
+            try:
+                # If not raise exception, there is already the column on the array
+                dmap_data_indices[y][x] = dword_columns_offset_array[ columns_array.index(column_data) ]
+            except ValueError:
+                # new column, so register it
+                columns_set.add(column_data)
+                columns_array.append(column_data)
+
+                dword_columns_offset_array.append(dword_column_offset)
+                
+                # encode column dword to populate "data[256][256]"
+                dmap_data_indices[y][x] = dword_column_offset
+
+                dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
+
+
+
+            if False:   # old
+                if column_data not in columns_set:
+                    # new column, so register it
+                    columns_set.add(column_data)
+                    columns_array.append(column_data)
+
+                    dword_columns_offset_array.append(dword_column_offset)
+                    dword_column_offset += len(column_data) // DATA_SIZE    # 4 = size of dword
+
+                    # encode column dword to populate "data[256][256]"
+                    dmap_data_indices[y][x] = dmap_index
+                    dmap_index += 1
+                else:
+                    # there is already the column on the array
+                    dmap_data_indices[y][x] = columns_array.index(column_data)
+
+            percentage += 0.00001525878
+
+            
+
+            curr_time = time.time()
+            if (curr_time - old_time > 5):
+                old_time = curr_time
+                print("{:.0%}".format(percentage))
+                
+    print(f"Created columns in {(curr_time - init_time):.3f} seconds")
+
+    return (dmap_data_indices, columns_array, dword_columns_offset_array, block_list)
+
+
 def search_data(input_data, header_to_found):
     for header, data in input_data:
         if header == header_to_found:
@@ -745,12 +853,12 @@ def create_dmap(dmap_base_indices, columns_array, block_list, dword_columns_offs
 
     # create column data
     column_data = bytes()
-    column_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)    #column_dwords = dword_columns_offset_array[-1]
+    column_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)
     dmap_dict["column_dwords"] = column_dwords
     for column in columns_array:
         column_data += column
     
-    assert len(column_data) == DWORD_SIZE*column_dwords# + len(columns_array[-1])
+    assert len(column_data) == DWORD_SIZE*column_dwords # + len(columns_array[-1])
     dmap_dict["column_data"] = column_data
     
     # create block info data
@@ -896,21 +1004,27 @@ def main():
 
     print("Getting block info from uncompressed data...")
     block_info_array = get_block_info_data_from_UMAP(gmp_path, chunk_infos)
-    print("Creating set from block array...")
-    block_set = create_set_from_array(block_info_array)     # exclude repeated blocks
 
-    block_list = list(block_set)
 
-    print(f"Num of unique blocks: {len(block_list)}")
+    if False:
+        print("Creating set from block array...")
+        block_set = create_set_from_array(block_info_array)     # exclude repeated blocks
+
+        block_list = list(block_set)
+
+        print(f"Num of unique blocks: {len(block_list)}")
+
 
     print("Creating columns...")
-    dmap_data_indices, columns_array, dword_columns_offset_array = create_columns(block_info_array, block_list)
+    #dmap_data_indices, columns_array, dword_columns_offset_array = create_columns_old(block_info_array, block_list)
+    dmap_data_indices, columns_array, dword_columns_offset_array, block_list = create_columns(block_info_array)
 
     #num_dwords = dword_columns_offset_array[-1] #+ (len(columns_array[-1]))//4
     num_dwords = dword_columns_offset_array[-1] + ((len(columns_array[-1])) // 4)
 
     print(f"Num of dwords: {num_dwords}")
     print(f"Num of columns: {len(columns_array)}")
+    print(f"Num of unique blocks: {len(block_list)}")
 
     dmap_info = create_dmap(dmap_data_indices, columns_array, block_list, dword_columns_offset_array)
 
