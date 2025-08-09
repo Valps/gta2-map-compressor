@@ -43,4 +43,4 @@ Then rebuild the iso with the changes and it's ready to play.
 # Known problems
 
 - Intermediary gradient slopes with side tiles aren't fixed yet, so if you put tiles on an incomplete gradient slope, the forbidden side will be rendered in-game as a weird wall, preventing the player from passing through the slope.
-- Hidden surfaces removal is not implemented yet.
+- Hidden surfaces removal is not implemented yet. (workaround: remove them using the official map editor once, then reopen the map in PC compression mode and save it uncompressed. So thereafter the most hidden surfaces were disappeared)
