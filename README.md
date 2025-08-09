@@ -39,3 +39,8 @@ First you need a program to dump and build PSX ISOs, such as mkpsxiso. After dum
 - BIL.GMP (Industrial District)
 
 Then rebuild the iso with the changes and it's ready to play.
+
+# Known problems
+
+- Intermediary gradient slopes with side tiles aren't fixed yet, so if you put tiles on an incomplete gradient slope, the forbidden side will be rendered in-game as a weird wall, preventing the player from passing through the slope.
+- Hidden surfaces removal is not implemented yet.
