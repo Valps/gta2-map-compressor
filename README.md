@@ -1,5 +1,5 @@
 # gta2-map-compressor
-It compress an uncompressed GMP map file for PC or PSX version of GTA2. 
+It compress an uncompressed GMP map file for PC or PSX version of GTA2. Running in CPython (default python interpreter) it will compress the map approximately two times (or more) faster than the official map editor.
 
 # How to use
 
