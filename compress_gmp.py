@@ -47,6 +47,8 @@ CHUNK_PADDING_BYTE = bytes([int("0xAA", 16)])   # only for cmap/psx gmp maps
 
 WORD_MAX_VALUE = 65535  # 0xFFFF
 
+PERCENTAGE_UPDATE_SECONDS = 1   # update percentage after x seconds
+
 # TODO: convert this code to use classes/objects
 class DMAP_compressed:
     def __init__(self, data: bytes, num_dwords: int, columns_data: bytes, num_blocks: int, block_info: bytes):
@@ -89,23 +91,6 @@ def is_slope(block_data):
     if (slope_byte > 60):
         return False
     return True
-
-# convert PSX slope to PC slope
-def fix_psx_slope(block_data):
-    slope_byte = block_data[-1]
-    slope_byte = slope_byte >> 2
-    if (49 <= slope_byte <= 52):
-        lid = int.from_bytes(block_data[8:10], 'little')
-        tile_texture_idx = (lid % 1024)
-        if tile_texture_idx == 384:
-            tile_texture_idx = 1023
-            lid = lid | tile_texture_idx    # set all lowest 10 bits to 1  (1111 1111 11 = 1023)
-            new_block_data = block_data[:8] + bytes([lid % 256, lid // 256]) + block_data[10:]
-        else:
-            new_block_data = block_data
-    else:
-        new_block_data = block_data
-    return new_block_data
 
 # convert PC slope to PSX slope
 def fix_pc_slope(block_data):
@@ -194,298 +179,6 @@ def detect_headers_and_get_chunks(gmp_path):
     print("")
     return chunk_info, data_array
 
-
-############ DMAP stuff
-
-def DMAP_read_all_columns(gmp_path, chunk_infos):
-    
-    with open(gmp_path, 'rb') as file:
-        
-        dmap_offset = chunk_infos["DMAP"][0]
-        size = chunk_infos["DMAP"][1]
-
-        file.seek(dmap_offset + DMAP_COLUMN_OFFSET)
-        column_words = int.from_bytes(file.read(4), 'little')
-
-        print(f"Num of columns words: {column_words}")
-
-        words = 0
-        column_idx = 0
-
-        while (words < 2*column_words):
-            start_offset = file.tell()
-
-            column_height = int.from_bytes(file.read(1))
-            column_offset = int.from_bytes(file.read(1))
-            num_blocks = column_height - column_offset
-            
-            if column_height > 7:
-                print(f"\nError: height {column_height} above 7. Column {column_idx} at offset {hex(start_offset)}")
-                print(f"words count = {words}")
-                sys.exit(-1)
-
-            if column_offset > 7:
-                print(f"\nError: BlockOffset {column_offset} above 7. Column {column_idx} at offset {hex(start_offset)}")
-                print(f"words count = {words}")
-                sys.exit(-1)
-
-            # get back to start position
-            file.seek(start_offset)
-
-            # 1 for height, 1 for offset, 2 for pad, 4*num_blocks for blockd
-            column_size = 1 + 1 + 2 + 4*num_blocks
-
-            if column_size < 0:
-                print(f"ERROR: negative column_size: {column_size}")
-                print(f"Column: {column_idx}, Height = {column_height}, Block Offset = {column_offset}")
-                print(f"File Offset: {hex(start_offset)}")
-                sys.exit(-1)
-
-            file.read(column_size)
-
-            words += column_size // 2
-            column_idx += 1
-        
-        print(f"Number of columns: {column_idx}")
-
-        column_finish_offset = file.tell()
-
-        print(f"Column data finish offset: {hex(column_finish_offset)}")
-
-        num_total_blocks = int.from_bytes(file.read(4), 'little')
-        print(f"Num of unique blocks: {num_total_blocks}")
-
-    return column_finish_offset + 4
-
-def DMAP_decompress(gmp_path, chunk_infos, column_finish_offset):
-    # initialize block info array with empty blocks
-    empty_block_data = bytes([0 for _ in range(BLOCK_INFO_SIZE)])
-    block_info_array = [ [ [empty_block_data for _ in range(MAP_WIDTH+1)] for _ in range(MAP_HEIGHT+1) ] for _ in range(MAP_MAX_Z+1) ]
-
-    with open(gmp_path, 'rb') as file:
-        
-        dmap_offset = chunk_infos["DMAP"][0]
-        size = chunk_infos["DMAP"][1]
-
-        for y in range(MAP_HEIGHT+1):
-            for x in range(MAP_WIDTH+1):
-                tgt_block_column_data_offset = dmap_offset + 4*(x + y*256)
-
-                file.seek(tgt_block_column_data_offset)
-
-                words_offset = int.from_bytes(file.read(4), 'little')
-                tgt_column_offset = dmap_offset + DMAP_COLUMN_OFFSET + 4 + 4*words_offset
-
-                file.seek(tgt_column_offset)
-
-                column_height = int.from_bytes(file.read(1))
-                column_offset = int.from_bytes(file.read(1))
-                num_blocks = column_height - column_offset
-
-                #print(f"x,y = ({x}, {y})")
-                #print(f"Height: {column_height}")
-                #print(f"Offset: {column_offset}\n\n")
-
-                all_column_blocks_id = []
-
-                file.read(2)    # skip padding
-                
-                # get all block ids from this column
-                for block_idx in range(num_blocks):
-                    block_id = int.from_bytes( file.read(4) ,'little' )
-                    all_column_blocks_id.append( block_id )
-
-                # block info data starts at
-                block_info_array_offset = column_finish_offset
-
-                # get block info from each block using its id
-                for blockd_idx, block_id in enumerate(all_column_blocks_id):
-                    block_info_offset = block_info_array_offset + block_id*BLOCK_INFO_SIZE
-                    file.seek( block_info_offset )
-                    block_data = file.read(BLOCK_INFO_SIZE)
-                    block_z = column_offset + blockd_idx
-                    block_info_array[block_z][y][x] = block_data
-
-    return block_info_array
-
-############ CMAP stuff
-
-def CMAP_read_all_columns(gmp_path, chunk_infos):
-    
-    with open(gmp_path, 'rb') as file:
-        
-        dmap_offset = chunk_infos["CMAP"][0]
-        size = chunk_infos["CMAP"][1]
-
-        file.seek(dmap_offset + CMAP_COLUMN_OFFSET)
-        column_words = int.from_bytes(file.read(2), 'little')
-
-        print(f"Num of columns words: {column_words}")
-
-        words = 0
-        column_idx = 0
-
-        while (words < column_words):
-            start_offset = file.tell()
-
-            column_height = int.from_bytes(file.read(1))
-            column_offset = int.from_bytes(file.read(1))
-            num_blocks = column_height - column_offset
-            
-            if column_height > 7:
-                print(f"\nError: height {column_height} above 7. Column {column_idx} at offset {hex(start_offset)}")
-                print(f"words count = {words}")
-                sys.exit(-1)
-
-            if column_offset > 7:
-                print(f"\nError: BlockOffset {column_offset} above 7. Column {column_idx} at offset {hex(start_offset)}")
-                print(f"words count = {words}")
-                sys.exit(-1)
-
-            # get back to start position
-            file.seek(start_offset)
-
-            # 1 for height, 1 for offset, 2*num_blocks for blockd
-            column_size = 1 + 1 + 2*num_blocks
-
-            if column_size < 0:
-                print(f"ERROR: negative column_size: {column_size}")
-                print(f"Column: {column_idx}, Height = {column_height}, Block Offset = {column_offset}")
-                print(f"File Offset: {hex(start_offset)}")
-                sys.exit(-1)
-
-            file.read(column_size)
-
-            words += column_size // 2
-            column_idx += 1
-        
-        print(f"Number of columns: {column_idx}")
-
-        column_finish_offset = file.tell()
-        print(f"Column data start offset: {hex(dmap_offset + CMAP_COLUMN_OFFSET + 2)}")
-        print(f"Column data finish offset: {hex(column_finish_offset)}")
-
-        block_data_info_offset = column_finish_offset + 1024 # TODO: psx vs pc CMAP: include 1024 (padding?)
-        
-
-        file.seek(block_data_info_offset)  
-        num_total_blocks = int.from_bytes(file.read(2), 'little')
-        print(f"Num unique blocks: {num_total_blocks}")
-
-        block_data_finish_offset = block_data_info_offset + num_total_blocks*BLOCK_INFO_SIZE
-
-
-    print(f"Block info start offset = {hex(block_data_info_offset)}")
-    print(f"Block info end offset = {hex(block_data_finish_offset)}")
-
-    return block_data_info_offset + 2, block_data_finish_offset, num_total_blocks
-
-def CMAP_decompress(gmp_path, chunk_infos, block_data_finish_offset, block_data_info_offset, num_total_blocks):
-    strange_blocks = 0
-    normal_blocks = 0
-    max_idx_below_8000 = 0
-    max_idx_above_8000 = 0
-    min_idx_above_8000 = 40000
-    # initialize block info array with empty blocks
-    empty_block_data = bytes([0 for _ in range(BLOCK_INFO_SIZE)])
-    block_info_array = [ [ [empty_block_data for _ in range(MAP_WIDTH+1)] for _ in range(MAP_HEIGHT+1) ] for _ in range(MAP_MAX_Z+1) ]
-
-    with open(gmp_path, 'rb') as file:
-        
-        cmap_offset = chunk_infos["CMAP"][0]
-        size = chunk_infos["CMAP"][1]
-
-        # block info data starts at
-        block_info_array_offset = block_data_info_offset
-
-        #print(f"Unknown data again: {hex(block_data_finish_offset + 1536 + 4)}")
-
-        for y in range(MAP_HEIGHT+1):
-            for x in range(MAP_WIDTH+1):
-                tgt_block_column_data_offset = cmap_offset + 2*(x + y*256)
-
-                file.seek(tgt_block_column_data_offset)
-
-                words_offset = int.from_bytes(file.read(2), 'little')
-                tgt_column_offset = cmap_offset + CMAP_COLUMN_OFFSET + 2 + 2*words_offset
-
-                file.seek(tgt_column_offset)
-
-                column_height = int.from_bytes(file.read(1))
-                column_offset = int.from_bytes(file.read(1))
-                num_blocks = column_height - column_offset
-
-                #if x == 20 and y == 75:
-                #    print(f"({x}, {y}) Column offset: {hex(tgt_column_offset)}")
-
-                all_column_blocks_id = []
-
-                # get all block ids from this column
-                for block_idx in range(num_blocks):
-                    block_id = int.from_bytes( file.read(2), 'little' )
-
-                    # TODO: testing
-                    if block_id >= 32768:
-                        strange_blocks += 1
-                        if block_id > max_idx_above_8000:
-                            max_idx_above_8000 = block_id
-                        if block_id < min_idx_above_8000:
-                            min_idx_above_8000 = block_id
-                    else:
-                        normal_blocks += 1
-                        if block_id > max_idx_below_8000:
-                            max_idx_below_8000 = block_id
-
-                    all_column_blocks_id.append( block_id )
-
-                # get block info from each block using its id
-                for blockd_idx, block_id in enumerate(all_column_blocks_id):
-                    if (block_id < 32768):
-                        block_info_offset = block_info_array_offset + BLOCK_INFO_SIZE*block_id  #block_id*BLOCK_INFO_SIZE
-                        file.seek( block_info_offset )
-                        block_data = file.read(BLOCK_INFO_SIZE)
-
-                        # now fix tile 384 to 1023 for 3-sided slopes
-                        if is_slope(block_data):
-                            block_data = fix_psx_slope(block_data)
-                    else:
-                        block_info_offset = block_data_finish_offset + 1536 + 4 + 4*(block_id - 32768)    # 1536 = 0x600
-                        file.seek( block_info_offset )
-                        lid_slope_data = file.read(4)
-                        block_data = bytes([0,0  ,  0,0  ,  0,0  ,  0,0 ]) + lid_slope_data
-                    
-                    z = column_offset + blockd_idx
-                    block_info_array[z][y][x] = block_data
-
-    print(f"Normal blocks with index below 0x8000: {normal_blocks}")
-    print(f"Strange blocks with index above 0x8000: {strange_blocks}")
-    print(f"Max idx below 0x8000: {max_idx_below_8000}")
-    print(f"Max idx above 0x8000: {max_idx_above_8000}; Min idx: {min_idx_above_8000}")
-    print(f"Thus, unique blocks with idx above 0x8000: {max_idx_above_8000 - min_idx_above_8000 + 1}")
-    return block_info_array
-
-
-def uncompress_gmp(gmp_path, chunk_infos, psx):
-
-    if not psx and chunk_infos["DMAP"][0] is None:
-        print("Error: This program only read compressed maps.")
-        sys.exit(-1)
-
-    if psx and chunk_infos["CMAP"][0] is None:
-        print("Error: This program only read compressed maps.")
-        sys.exit(-1)
-
-    if not psx:
-        column_finish_offset = DMAP_read_all_columns(gmp_path, chunk_infos)
-        print(f"Column finish offset = {hex(column_finish_offset)}")
-        block_info_array = DMAP_decompress(gmp_path, chunk_infos, column_finish_offset)
-    else:
-        block_data_info_offset, block_data_finish_offset, num_total_blocks = CMAP_read_all_columns(gmp_path, chunk_infos)
-        print(f"Unknown data at {hex(block_data_finish_offset + 1536 + 2)}\n")
-        block_info_array = CMAP_decompress(gmp_path, chunk_infos, block_data_finish_offset, block_data_info_offset, num_total_blocks)
-
-    return block_info_array
-
 def get_block_info_data_from_UMAP(gmp_path, chunk_infos):
 
     xyz_array = []
@@ -529,25 +222,6 @@ def get_block_info_data_from_UMAP(gmp_path, chunk_infos):
                 z += 1
 
     return xyz_array
-
-# not used
-def get_block_data_set_from_UMAP(gmp_path, chunk_infos):
-
-    block_set = set()
-
-    with open(gmp_path, 'rb') as file:
-        umap_offset = chunk_infos["UMAP"][0]
-        size = chunk_infos["UMAP"][1]
-        file.seek(umap_offset)
-        current_offset = umap_offset
-
-        while (current_offset < umap_offset + size):
-
-            block_data = file.read(BLOCK_INFO_SIZE)
-            current_offset += BLOCK_INFO_SIZE
-            block_set.add(block_data)
-
-    return block_set
 
 
 def is_partial_block(block_data) -> bool:
@@ -694,7 +368,7 @@ def create_cmap_columns(block_info_array):
             percentage += 0.00001525878
 
             curr_time = time.time()
-            if (curr_time - old_time > 5):
+            if (curr_time - old_time > PERCENTAGE_UPDATE_SECONDS):
                 old_time = curr_time
                 print("{:.0%}".format(percentage), end=" \r")
 
@@ -798,7 +472,7 @@ def create_dmap_columns(block_info_array):
             percentage += 0.00001525878
 
             curr_time = time.time()
-            if (curr_time - old_time > 5):
+            if (curr_time - old_time > PERCENTAGE_UPDATE_SECONDS):
                 old_time = curr_time
                 print("{:.0%}".format(percentage), end=" \r")
 
@@ -1158,7 +832,7 @@ def compress_gmp_psx_version(block_info_array, output_path, chunk_infos, data):
 def is_opaque(block_data):
     lid_word = int.from_bytes(block_data[8:10], 'little')
     tile_idx = lid_word & 1023
-    if tile_idx == 0:
+    if tile_idx == 0 or tile_idx == 1023:   # no tiles or it's a triangle slope type
         return True
     flat = (lid_word >> 12) & 1
     if flat:
@@ -1185,23 +859,55 @@ def is_empty_block(block_data):
                 return True
     return False
 
+def has_any_tiles(block_data):
+    lid_word = int.from_bytes(block_data[8:10], 'little')
+    lid_tile = lid_word % 1024
+    if (lid_tile == 0):
+        left_word = int.from_bytes(block_data[0:2], 'little')
+        right_word = int.from_bytes(block_data[2:4], 'little')
+        top_word = int.from_bytes(block_data[4:6], 'little')
+        bottom_word = int.from_bytes(block_data[6:8], 'little')
+        if (left_word == 0 and right_word == 0 and top_word == 0 and bottom_word == 0):
+            return False
+    return True
+
+
+def remove_surfaces(block_data):
+    left_word = int.from_bytes(block_data[0:2], 'little')
+    right_word = int.from_bytes(block_data[2:4], 'little')
+    top_word = int.from_bytes(block_data[4:6], 'little')
+    bottom_word = int.from_bytes(block_data[6:8], 'little')
+    lid_word = int.from_bytes(block_data[8:10], 'little')
+
+    lid_word = lid_word & ~1023         # clear lid tile
+    left_word = left_word & ~1023       # clear left tile
+    right_word = right_word & ~1023     # clear right tile
+    top_word = top_word & ~1023         # clear top tile
+    bottom_word = bottom_word & ~1023   # clear bottom tile
+
+    new_block_data = ( convert_int_to_word(left_word) +
+                       convert_int_to_word(right_word) +
+                       convert_int_to_word(top_word) +
+                       convert_int_to_word(bottom_word) +
+                       convert_int_to_word(lid_word) + block_data[10:])
+    return new_block_data
+
 # TODO: remove hidden surfaces
 def remove_hidden_surfaces(block_info_array):
+    return block_info_array
     
     for y in range(1, MAP_HEIGHT):
         for x in range(1, MAP_WIDTH):
-            # identify the highest block
-            highest_z = 8
-            for z in reversed(range(MAP_MAX_Z)):
-                block_data = block_info_array[z][y][x]
-                if not is_opaque(block_data):
-                    highest_z = z
-                    break
+            
 
-            for z in reversed(range(highest_z)):
-                block_data = block_info_array[z][y][x]
-                if not is_empty_block(block_data):
-                    pass
+            for z in range(MAP_MAX_Z):
+                
+                block_to_check = block_info_array[z][y][x]
+
+                # TODO: new strategy: check each side of each block, instead of looking for blocks
+                # and deleting all their sides
+
+                #block_info_array[z][y][x] = remove_surfaces(block_to_check)
 
     return block_info_array
 
@@ -1210,6 +916,7 @@ def main():
     parser = argparse.ArgumentParser(PROGRAM_NAME)
     parser.add_argument("gmp_path")
     parser.add_argument("platform")
+    parser.add_argument("-r", "--remove_hidden", action="store_true")
     args = parser.parse_args()
 
     if (not args.gmp_path
@@ -1245,8 +952,9 @@ def main():
     print("Getting block info from uncompressed data...")
     block_info_array = get_block_info_data_from_UMAP(gmp_path, chunk_infos)
 
-    # TODO: remove hidden surfaces
-    if False:
+    
+    if args.remove_hidden:
+        print("Removing Hidden Surfaces...")
         block_info_array = remove_hidden_surfaces(block_info_array)
 
     # get output folder path
