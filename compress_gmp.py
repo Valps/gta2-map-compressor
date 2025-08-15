@@ -5,6 +5,7 @@ import sys
 import os
 
 import time
+import _io
 
 PROGRAM_NAME = os.path.basename(sys.argv[0])
 ROOT_DIR = Path(__file__).parent
@@ -172,7 +173,7 @@ def detect_headers_and_get_chunks(gmp_path):
 
                 print(f"Header {chunk_header} found! Offset: {hex(header_data_offset)}, Size: {hex(header_size)}")
 
-                data = file.read(header_size)  # read data # skip data
+                data = file.read(header_size)  # read data
                 data_array.append((chunk_header, data))
                 
                 current_offset += header_size
@@ -180,6 +181,7 @@ def detect_headers_and_get_chunks(gmp_path):
     return chunk_info, data_array
 
 def get_block_info_data_from_UMAP(gmp_path, chunk_infos):
+    """Read all blocks from uncompressed map."""
 
     xyz_array = []
 
@@ -237,6 +239,7 @@ def is_partial_block(block_data) -> bool:
     return False
 
 def get_partial_data_from_block(block_data):
+    """Return Lid word + arrow byte + slope byte."""
     return block_data[8:]
 
 def create_cmap_columns(block_info_array):
@@ -498,8 +501,7 @@ def create_cmap(cmap_base, columns_array, complete_block_list, partial_block_lis
                      num_partial_blocks=0, 
                      partial_block_info=None)
 
-    # create base data chunk
-    #print("Creating CMAP base data...")
+    # create cmap base data
     base = bytes()
     for y in range(MAP_HEIGHT+1):
         for x in range(MAP_WIDTH+1):
@@ -509,7 +511,6 @@ def create_cmap(cmap_base, columns_array, complete_block_list, partial_block_lis
     cmap_dict["base"] = base
 
     # create column data
-    #print("Creating column data...")
     column_data = bytes()
     column_words = word_columns_offset_array[-1] + ((len(columns_array[-1])) // WORD_SIZE)
     cmap_dict["column_words"] = column_words
@@ -520,7 +521,6 @@ def create_cmap(cmap_base, columns_array, complete_block_list, partial_block_lis
     cmap_dict["column_data"] = column_data
 
     # create complete block info data
-    #print("Creating complete block data...")
     complete_block_info = bytes()
     num_complete_blocks = len(complete_block_list)
     cmap_dict["num_complete_blocks"] = num_complete_blocks
@@ -532,7 +532,6 @@ def create_cmap(cmap_base, columns_array, complete_block_list, partial_block_lis
 
 
     # create partial block info data
-    #print("Creating partial block data...")
     partial_block_info = bytes()
     num_partial_blocks = len(partial_block_list)
     cmap_dict["num_partial_blocks"] = num_partial_blocks
@@ -542,6 +541,7 @@ def create_cmap(cmap_base, columns_array, complete_block_list, partial_block_lis
     assert len(partial_block_info) == PARTIAL_BLOCK_INFO_SIZE*num_partial_blocks
     cmap_dict["partial_block_info"] = partial_block_info
 
+    # compute cmap chunk size
     cmap_dict["size"] = ( len(base) + WORD_SIZE + len(column_data) + FIRST_CMAP_PADDING_SIZE + WORD_SIZE 
                           + len(complete_block_info) + SECOND_CMAP_PADDING_SIZE + WORD_SIZE + len(partial_block_info) )
 
@@ -552,7 +552,7 @@ def create_dmap(dmap_base, columns_array, block_list, dword_columns_offset_array
 
     dmap_dict = dict(size=0, base=None, column_dwords=0, column_data=None, num_blocks=0, block_info=None)
 
-    # create base data chunk
+    # create dmap base data
     base = bytes()
     for y in range(MAP_HEIGHT+1):
         for x in range(MAP_WIDTH+1):
@@ -581,20 +581,43 @@ def create_dmap(dmap_base, columns_array, block_list, dword_columns_offset_array
     assert len(block_info) == BLOCK_INFO_SIZE*num_blocks
     dmap_dict["block_info"] = block_info
 
+    # compute dmap chunk size
     dmap_dict["size"] = len(base) + DWORD_SIZE + len(column_data) + DWORD_SIZE + len(block_info)
 
     return dmap_dict
 
+def write_psx_pad(file: _io.BufferedRandom):
+    offset = file.tell()
+    if offset % DWORD_SIZE != 0:    # if there is a dword to complete
+        while offset % DWORD_SIZE != 0:
+            file.write(CHUNK_PADDING_BYTE)
+            offset += 1
+    else:
+        # Even if a padding is not necessary, the game requires at least one byte padding or else it will crash
+        # so in this case we need 4 byte padding
+        for _ in range(4):
+            file.write(CHUNK_PADDING_BYTE)
+
+def copy_chunk_to_file(file: _io.BufferedRandom, str_header, chunk_infos, data):
+    chunk_header = str.encode(str_header)
+    file.write(chunk_header)
+
+    chunk_size = convert_int_to_dword(chunk_infos[str_header][1])
+    file.write(chunk_size)
+    file.write( search_data(data, str_header) )
 
 def create_gmp_psx_version(output_path, cmap_info, chunk_infos, data):
     with open(output_path, 'w+b') as file:
         # CMAP
+        # Chunk Header
         chunk_header = str.encode("CMAP")
         file.write(chunk_header)
 
+        # CMAP size
         cmap_size = convert_int_to_dword(cmap_info["size"])
         file.write(cmap_size)
 
+        # now register cmap data
         file.write(cmap_info["base"])
         file.write(convert_int_to_word(cmap_info["column_words"]))
         file.write(cmap_info["column_data"])
@@ -624,75 +647,24 @@ def create_gmp_psx_version(output_path, cmap_info, chunk_infos, data):
         file.write(cmap_info["partial_block_info"])
 
         # now pad the last dword of CMAP chunk.
-        offset = file.tell()
-
-        if offset % DWORD_SIZE != 0:
-            while offset % DWORD_SIZE != 0:
-                file.write(CHUNK_PADDING_BYTE)
-                offset += 1
-        else:
-            # Even if a padding is not necessary, the game requires at least one byte padding or else it will crash
-            for _ in range(4):
-                file.write(CHUNK_PADDING_BYTE)
+        write_psx_pad(file)
 
         # CMAP chunk finished!
 
         # ZONE
         if chunk_infos["ZONE"][0] is not None:
-            chunk_header = str.encode("ZONE")
-            file.write(chunk_header)
-
-            zone_size = convert_int_to_dword(chunk_infos["ZONE"][1])
-            file.write(zone_size)
-            file.write( search_data(data, "ZONE") )
-
-            # now pad the last dword
-            offset = file.tell()
-            if offset % DWORD_SIZE != 0:
-                while offset % DWORD_SIZE != 0:
-                    file.write(CHUNK_PADDING_BYTE)
-                    offset += 1
-            else:
-                for _ in range(4):
-                    file.write(CHUNK_PADDING_BYTE)
+            copy_chunk_to_file(file, "ZONE", chunk_infos, data)
+            write_psx_pad(file)
 
         # ANIM
         if chunk_infos["ANIM"][0] is not None:
-            chunk_header = str.encode("ANIM")
-            file.write(chunk_header)
-
-            anim_size = convert_int_to_dword(chunk_infos["ANIM"][1])
-            file.write(anim_size)
-            file.write( search_data(data, "ANIM") )
-
-            # now pad the last dword
-            offset = file.tell()
-            if offset % DWORD_SIZE != 0:
-                while offset % DWORD_SIZE != 0:
-                    file.write(CHUNK_PADDING_BYTE)
-                    offset += 1
-            else:
-                for _ in range(4):
-                    file.write(CHUNK_PADDING_BYTE)
+            copy_chunk_to_file(file, "ANIM", chunk_infos, data)
+            write_psx_pad(file)
 
         # RGEN
         if chunk_infos["RGEN"][0] is not None:
-            chunk_header = str.encode("RGEN")
-            file.write(chunk_header)
-
-            rgen_size = convert_int_to_dword(chunk_infos["RGEN"][1])
-            file.write(rgen_size)
-            file.write( search_data(data, "RGEN") )
-
-            # now pad the last dword
-            offset = file.tell()
-            if offset % DWORD_SIZE != 0:
-                while offset % DWORD_SIZE != 0:
-                    file.write(CHUNK_PADDING_BYTE)
-                    offset += 1
-            else:
-                for _ in range(4):
-                    file.write(CHUNK_PADDING_BYTE)
+            copy_chunk_to_file(file, "RGEN", chunk_infos, data)
+            write_psx_pad(file)
     
     return 0
 
@@ -705,18 +677,6 @@ def create_gmp_pc_version(output_path, dmap_info, chunk_info, data):
 
         version = convert_int_to_word(500)
         file.write(version)
-
-        # UMAP
-        #chunk_header = str.encode("UMAP")
-        #file.write(chunk_header)
-
-        #umap_size = convert_int_to_dword(UMAP_SIZE)
-        #file.write(umap_size)
-
-        #for z in range(len(block_info_array)):
-        #    for y in range(len(block_info_array[z])):
-        #        for x in range(len(block_info_array[z][y])):
-        #            file.write(block_info_array[z][y][x])
 
         # DMAP
         chunk_header = str.encode("DMAP")
@@ -734,57 +694,27 @@ def create_gmp_pc_version(output_path, dmap_info, chunk_info, data):
 
         # ZONE
         if chunk_info["ZONE"][0] is not None:
-            chunk_header = str.encode("ZONE")
-            file.write(chunk_header)
-
-            zone_size = convert_int_to_dword(chunk_info["ZONE"][1])
-            file.write(zone_size)
-            file.write( search_data(data, "ZONE") )
+            copy_chunk_to_file(file, "ZONE", chunk_info, data)
 
         # PSXM
         if chunk_info["PSXM"][0] is not None:
-            chunk_header = str.encode("PSXM")
-            file.write(chunk_header)
-
-            psxm_size = convert_int_to_dword(chunk_info["PSXM"][1])
-            file.write(psxm_size)
-            file.write( search_data(data, "PSXM") )
+            copy_chunk_to_file(file, "PSXM", chunk_info, data)
 
         # ANIM
         if chunk_info["ANIM"][0] is not None:
-            chunk_header = str.encode("ANIM")
-            file.write(chunk_header)
-
-            anim_size = convert_int_to_dword(chunk_info["ANIM"][1])
-            file.write(anim_size)
-            file.write( search_data(data, "ANIM") )
+            copy_chunk_to_file(file, "ANIM", chunk_info, data)
 
         # LGHT
         if chunk_info["LGHT"][0] is not None:
-            chunk_header = str.encode("LGHT")
-            file.write(chunk_header)
-
-            lght_size = convert_int_to_dword(chunk_info["LGHT"][1])
-            file.write(lght_size)
-            file.write( search_data(data, "LGHT") )
+            copy_chunk_to_file(file, "LGHT", chunk_info, data)
         
         # EDIT
         if chunk_info["EDIT"][0] is not None:
-            chunk_header = str.encode("EDIT")
-            file.write(chunk_header)
-
-            edit_size = convert_int_to_dword(chunk_info["EDIT"][1])
-            file.write(edit_size)
-            file.write( search_data(data, "EDIT") )
+            copy_chunk_to_file(file, "EDIT", chunk_info, data)
 
         # RGEN
         if chunk_info["RGEN"][0] is not None:
-            chunk_header = str.encode("RGEN")
-            file.write(chunk_header)
-
-            rgen_size = convert_int_to_dword(chunk_info["RGEN"][1])
-            file.write(rgen_size)
-            file.write( search_data(data, "RGEN") )
+            copy_chunk_to_file(file, "RGEN", chunk_info, data)
     return 0
 
 # Compress map to PC version
